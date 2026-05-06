@@ -1,0 +1,23 @@
+[project]
+name = "encrypt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Aryanshr", email = "Arynshr@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "blake3>=1.0.8",
+    "msgpack>=1.1.2",
+    "pynacl>=1.6.1",
+    "quart>=0.20.0",
+    "textual>=6.6.0",
+]
+
+[project.scripts]
+encrypt = "encrypt:main"
+
+[build-system]
+requires = ["uv_build>=0.9.10,<0.10.0"]
+build-backend = "uv_build"
