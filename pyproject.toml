@@ -1,7 +1,7 @@
 [project]
 name = "encrypt"
 version = "0.1.0"
-description = "Add your description here"
+description = "P2P encrypted LAN chat with UDP multicast discovery"
 readme = "README.md"
 authors = [
     { name = "Aryanshr", email = "Arynshr@users.noreply.github.com" }
@@ -11,7 +11,6 @@ dependencies = [
     "blake3>=1.0.8",
     "msgpack>=1.1.2",
     "pynacl>=1.6.1",
-    "quart>=0.20.0",
     "textual>=6.6.0",
 ]
 
