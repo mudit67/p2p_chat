@@ -115,6 +115,11 @@ class ChatApp(App):
         ("l", "verify_log", "Verify Log"),
     ]
 
+    # Peer discovery timeout (remove peers not seen for 10 seconds)
+    PEER_TIMEOUT_SECONDS = 10.0
+    # Cleanup check interval (every 2 seconds)
+    PEER_CLEANUP_INTERVAL = 2.0
+
     connected = reactive(False)
     identity: Identity
     logger: SecureLogger
@@ -149,6 +154,7 @@ class ChatApp(App):
         self.relay_reader = None
         self.relay_writer = None
         self.relay_peer_pk = None
+        self._cleanup_task: Optional[asyncio.Task[None]] = None
         key_path = Path("keys") / f"{user}.json"
         self.identity = Identity.load(str(key_path))
         log_path = Path("logs") / f"{user}.log"
@@ -168,6 +174,7 @@ class ChatApp(App):
     def on_mount(self) -> None:
         self.write_log(f"Starting in [bold]{self.mode.upper()}[/] mode...")
         asyncio.create_task(self.connect())
+        self._cleanup_task = asyncio.create_task(self._peer_cleanup_loop())
 
     async def connect(self) -> None:
         if self.mode == "udp":
@@ -224,7 +231,10 @@ class ChatApp(App):
             return
         username = str(presence["u"])
         peer_addr = (addr[0], int(presence["p"]))
-        if peer_pk not in self.peers:
+        is_new_peer = peer_pk not in self.peers
+        
+        if is_new_peer:
+            # New peer discovered
             tx_key, rx_key = self._derive_session(peer_pk)
             self.peers[peer_pk] = PeerSession(
                 username=username, pk=peer_pk, addr=peer_addr, tx_key=tx_key, rx_key=rx_key
@@ -232,9 +242,15 @@ class ChatApp(App):
             self.write_log(f"[green]Discovered peer[/] {username} ({peer_pk.hex()[:8]}) @ {peer_addr}")
             if self.selected_peer_hex is None:
                 self.selected_peer_hex = peer_pk.hex()[:8]
-        peer = self.peers[peer_pk]
-        peer.addr = peer_addr
-        peer.last_seen = time.time()
+        else:
+            # Peer reconnected or updated
+            peer = self.peers[peer_pk]
+            if peer.addr != peer_addr:
+                self.write_log(f"[yellow]Peer reconnected[/] {username} @ {peer_addr}")
+            peer.username = username  # Update username if changed
+            peer.addr = peer_addr
+        
+        self.peers[peer_pk].last_seen = time.time()
         self._refresh_peers_panel()
 
     def _refresh_peers_panel(self) -> None:
@@ -247,7 +263,9 @@ class ChatApp(App):
         for peer in sorted(self.peers.values(), key=lambda p: p.username):
             age = int(now - peer.last_seen)
             marker = "*" if peer.pk.hex()[:8] == self.selected_peer_hex else " "
-            lines.append(f"{marker} {peer.username:<10} {peer.pk.hex()[:8]}  {age:>3}s")
+            # Show status indicator
+            status = "✓" if age < 5 else "◐" if age < 10 else "✗"
+            lines.append(f"{marker} {status} {peer.username:<8} {peer.pk.hex()[:8]}  {age:>3}s")
         panel.update("\n".join(lines))
 
     async def receive_loop(self) -> None:
@@ -271,6 +289,61 @@ class ChatApp(App):
                 self.write_log(f"[red]Receive loop error: {exc}[/]")
         self.connected = False
         self.query_one("#status", StatusBar).update("Disconnected")
+
+    async def _peer_cleanup_loop(self) -> None:
+        """Remove stale peers that haven't been seen in PEER_TIMEOUT_SECONDS."""
+        while True:
+            try:
+                await asyncio.sleep(self.PEER_CLEANUP_INTERVAL)
+                now = time.time()
+                stale_peers = [
+                    pk for pk, peer in self.peers.items()
+                    if now - peer.last_seen > self.PEER_TIMEOUT_SECONDS
+                ]
+                for pk in stale_peers:
+                    peer = self.peers.pop(pk)
+                    self.write_log(f"[dim]Peer offline[/] {peer.username} ({pk.hex()[:8]}) - not seen for {self.PEER_TIMEOUT_SECONDS}s")
+                    # Clear selection if selected peer went offline
+                    if peer.pk.hex()[:8] == self.selected_peer_hex:
+                        self.selected_peer_hex = None
+                    self._refresh_peers_panel()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.write_log(f"[red]Cleanup loop error: {e}[/]")
+
+    def action_quit(self) -> None:
+        """Gracefully shutdown - close discovery and cleanup."""
+        self.write_log("[yellow]Shutting down...[/]")
+        asyncio.create_task(self._shutdown())
+
+    async def _shutdown(self) -> None:
+        """Clean shutdown: stop discovery, close UDP transport, cancel tasks."""
+        self.connected = False
+        
+        # Stop discovery
+        if self.discovery:
+            await self.discovery.stop()
+            self.discovery = None
+        
+        # Close UDP transport
+        if self.udp_transport:
+            self.udp_transport.close()
+            self.udp_transport = None
+        
+        # Close relay connection
+        if self.relay_writer:
+            self.relay_writer.close()
+            await self.relay_writer.wait_closed()
+            self.relay_reader = None
+            self.relay_writer = None
+        
+        # Cancel cleanup task
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+        
+        # Exit app
+        self.exit()
 
     async def _handle_udp_packet(self, data: bytes, addr: tuple[str, int]) -> None:
         msg = unpack_udp_message(data)
