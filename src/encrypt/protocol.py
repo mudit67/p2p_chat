@@ -1,23 +1,24 @@
-"""
-Protocol: Msgpack over TLS. Types: connect, msg, ack. Includes hash for leak detection.
-"""
-import msgpack
+"""Wire protocol helpers for relay and UDP LAN chat modes."""
+
+from __future__ import annotations
+
 import time
-from typing import Dict, Any, Optional, cast
-from nacl.utils import random as nacl_random
+from typing import Any, Dict, Optional, cast
+
+import msgpack
 
 MSG_TYPES = {
-    'connect': 1,
-    'msg': 2,
-    'ack': 3
+    "connect": 1,   # Relay mode
+    "msg": 2,       # Relay mode payload
+    "ack": 3,       # Relay + UDP ack
+    "presence": 4,  # UDP discovery/presence
+    "udp_msg": 5,   # UDP encrypted direct message
 }
 
-def pack_connect(pk: bytes) -> bytes:
-    """Handshake: Send public key."""
-    return msgpack.packb({'type': MSG_TYPES['connect'], 'pk': pk})
+MAX_CLOCK_SKEW_SECONDS = 60.0
 
-def unpack_connect(data: bytes) -> Optional[Dict[str, Any]]:
-    """Unpack connection handshake."""
+
+def _unpack_dict(data: bytes) -> Optional[Dict[str, Any]]:
     try:
         result = msgpack.unpackb(data, raw=False)
         if not isinstance(result, dict):
@@ -26,62 +27,140 @@ def unpack_connect(data: bytes) -> Optional[Dict[str, Any]]:
     except (ValueError, TypeError, msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
         return None
 
+
+def _valid_timestamp(value: Any) -> bool:
+    try:
+        return abs(time.time() - float(value)) <= MAX_CLOCK_SKEW_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def pack_connect(pk: bytes) -> bytes:
+    return msgpack.packb({"type": MSG_TYPES["connect"], "pk": pk})
+
+
+def unpack_connect(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["connect"]:
+        return None
+    return msg
+
+
 def pack_message(to_pk: bytes, msg_hash: bytes, ciphertext: bytes, ts: float) -> bytes:
-    """Encrypted msg + metadata for relay."""
-    return msgpack.packb({
-        'type': MSG_TYPES['msg'],
-        'to': to_pk,
-        'h': msg_hash,
-        'c': ciphertext,
-        't': ts
-    })
+    return msgpack.packb(
+        {"type": MSG_TYPES["msg"], "to": to_pk, "h": msg_hash, "c": ciphertext, "t": ts}
+    )
+
 
 def unpack_message(data: bytes) -> Optional[Dict[str, Any]]:
-    """Validate ts (anti-replay, <60s)."""
-    try:
-        msg = msgpack.unpackb(data, raw=False)
-        if not isinstance(msg, dict):
-            return None
-        
-        # Validate timestamp - increased window to 60s for network delays
-        timestamp = msg.get('t')
-        if timestamp is None:
-            return None
-        try:
-            time_diff = abs(time.time() - float(timestamp))
-            if time_diff > 60:  # Increased from 30s to handle network delays
-                return None  # Stale timestamp
-        except (ValueError, TypeError):
-            return None
-        
-        return cast(Dict[str, Any], msg)
-    except (KeyError, ValueError, TypeError, msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
+    msg = _unpack_dict(data)
+    if not msg:
         return None
+    if msg.get("type") not in (MSG_TYPES["msg"], MSG_TYPES["udp_msg"]):
+        return None
+    if not _valid_timestamp(msg.get("t")):
+        return None
+    return msg
+
 
 def pack_ack(hash_val: bytes) -> bytes:
-    """Echo hash for sender verification."""
-    return msgpack.packb({'type': MSG_TYPES['ack'], 'h': hash_val})
+    return msgpack.packb({"type": MSG_TYPES["ack"], "h": hash_val, "t": time.time()})
+
 
 def unpack_ack(data: bytes) -> Optional[bytes]:
-    """Unpack acknowledgment and extract hash."""
-    try:
-        result = msgpack.unpackb(data, raw=False)
-        if not isinstance(result, dict):
-            return None
-        
-        h = result.get('h')
-        if h is None:
-            return None
-        
-        # Ensure we return bytes
-        if isinstance(h, bytes):
-            return h
-        elif isinstance(h, (list, tuple)):
-            return bytes(h)
-        else:
-            return None
-    except (KeyError, ValueError, TypeError, msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
+    result = _unpack_dict(data)
+    if not result or result.get("type") != MSG_TYPES["ack"]:
         return None
+    h = result.get("h")
+    if isinstance(h, bytes):
+        return h
+    if isinstance(h, (list, tuple)):
+        return bytes(h)
+    return None
 
-# Note: generate_nonce() is unused - nonces are generated in encrypt() function
-# Keeping for potential future use or removing if not needed
+
+def pack_presence(username: str, pk: bytes, listen_port: int, mode: str = "udp") -> bytes:
+    return msgpack.packb(
+        {
+            "type": MSG_TYPES["presence"],
+            "u": username,
+            "pk": pk,
+            "p": int(listen_port),
+            "m": mode,
+            "t": time.time(),
+        }
+    )
+
+
+def unpack_presence(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["presence"]:
+        return None
+    if not _valid_timestamp(msg.get("t")):
+        return None
+    if not isinstance(msg.get("u"), str):
+        return None
+    if not isinstance(msg.get("p"), int):
+        return None
+    return msg
+
+
+def pack_udp_message(
+    msg_id: bytes,
+    seq: int,
+    sender_pk: bytes,
+    to_pk: bytes,
+    msg_hash: bytes,
+    ciphertext: bytes,
+    ts: float,
+) -> bytes:
+    return msgpack.packb(
+        {
+            "type": MSG_TYPES["udp_msg"],
+            "id": msg_id,
+            "s": int(seq),
+            "from": sender_pk,
+            "to": to_pk,
+            "h": msg_hash,
+            "c": ciphertext,
+            "t": ts,
+        }
+    )
+
+
+def unpack_udp_message(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = unpack_message(data)
+    if not msg or msg.get("type") != MSG_TYPES["udp_msg"]:
+        return None
+    if not isinstance(msg.get("s"), int):
+        return None
+    if not isinstance(msg.get("id"), (bytes, bytearray)):
+        return None
+    return msg
+
+
+def pack_udp_ack(msg_id: bytes, msg_hash: bytes, sender_pk: bytes) -> bytes:
+    return msgpack.packb(
+        {
+            "type": MSG_TYPES["ack"],
+            "id": msg_id,
+            "h": msg_hash,
+            "from": sender_pk,
+            "t": time.time(),
+        }
+    )
+
+
+def unpack_udp_ack(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["ack"]:
+        return None
+    if not _valid_timestamp(msg.get("t")):
+        return None
+    if not isinstance(msg.get("id"), (bytes, bytearray)):
+        return None
+    if not isinstance(msg.get("h"), (bytes, bytearray)):
+        return None
+    if not isinstance(msg.get("from"), (bytes, bytearray)):
+        return None
+    return msg

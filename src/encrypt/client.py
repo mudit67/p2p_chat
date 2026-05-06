@@ -1,21 +1,47 @@
-"""
-TUI Client: Textual app with async network task. Handles connect, send/recv, leak detection, logging.
-"""
+"""Textual client for LAN UDP multi-peer encrypted chat."""
 
-import ssl
+from __future__ import annotations
+
 import asyncio
-import time
+import ssl
 import sys
-import msgpack
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Input, Button, Static, RichLog
-from textual.reactive import reactive
-from textual.message import Message
+
+from nacl.utils import random as nacl_random
 from textual import on
-from .crypto import Identity, key_exchange, key_exchange_server, encrypt, decrypt, hash_message, SecureLogger, PublicKey
-from .protocol import pack_connect, pack_message, unpack_message, pack_ack, unpack_ack, MSG_TYPES
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal
+from textual.message import Message
+from textual.reactive import reactive
+from textual.widgets import Button, Footer, Header, Input, RichLog, Static
+
+from .crypto import (
+    Identity,
+    PublicKey,
+    SecureLogger,
+    decrypt,
+    encrypt,
+    hash_message,
+    key_exchange,
+    key_exchange_server,
+)
+from .discovery import LanDiscovery, DISCOVERY_MULTICAST_PORT
+from .protocol import (
+    MSG_TYPES,
+    pack_ack,
+    pack_connect,
+    pack_message,
+    pack_udp_ack,
+    pack_udp_message,
+    unpack_ack,
+    unpack_message,
+    unpack_udp_ack,
+    unpack_udp_message,
+)
+from .udp_transport import UdpTransport
 
 
 class LeakAlert(Message):
@@ -24,22 +50,55 @@ class LeakAlert(Message):
 
 
 class StatusBar(Static):
-    """Reactive status bar."""
     pass
+
+
+@dataclass
+class PeerSession:
+    username: str
+    pk: bytes
+    addr: tuple[str, int]
+    tx_key: bytes
+    rx_key: bytes
+    last_seen: float = field(default_factory=time.time)
+    next_seq: int = 1
+
+
+@dataclass
+class PendingDelivery:
+    msg_id: bytes
+    msg_hash: bytes
+    packet: bytes
+    addr: tuple[str, int]
+    peer_name: str
+    message_text: str
+    attempts_left: int = 3
+    acked: bool = False
 
 
 class ChatApp(App):
     CSS = """
+    #main {
+        height: 1fr;
+    }
+    #peers {
+        width: 32;
+        border: round $accent;
+        padding: 0 1;
+    }
     RichLog {
         height: 1fr;
         background: $panel;
     }
-    Input {
+    #composer {
         dock: bottom;
+        height: 3;
+        padding: 0 1;
+    }
+    #composer Input {
         width: 1fr;
     }
-    Button {
-        dock: bottom;
+    #composer Button {
         margin-left: 1;
         width: auto;
     }
@@ -57,269 +116,361 @@ class ChatApp(App):
     ]
 
     connected = reactive(False)
-    peer_pk: Optional[bytes] = None
     identity: Identity
     logger: SecureLogger
-    reader: Optional[asyncio.StreamReader] = None
-    writer: Optional[asyncio.StreamWriter] = None
-    tx_key: Optional[bytes] = None  # For sending
-    rx_key: Optional[bytes] = None  # For receiving
-    pending_acks: dict[bytes, asyncio.Future] = {}  # Hash -> Future for ACK
+    udp_transport: Optional[UdpTransport] = None
+    discovery: Optional[LanDiscovery] = None
+    peers: dict[bytes, PeerSession]
+    selected_peer_hex: Optional[str]
+    pending_deliveries: dict[bytes, PendingDelivery]
+    relay_reader: Optional[asyncio.StreamReader]
+    relay_writer: Optional[asyncio.StreamWriter]
+    relay_peer_pk: Optional[bytes]
 
-    def __init__(self, user: str, host: str = '127.0.0.1', port: int = 8888):
+    def __init__(
+        self,
+        user: str,
+        mode: str = "udp",
+        host: str = "127.0.0.1",
+        relay_port: int = 8888,
+        udp_port: int = 9000,
+        discovery_port: int = DISCOVERY_MULTICAST_PORT,
+    ):
         super().__init__()
         self.user = user
+        self.mode = mode
         self.host = host
-        self.port = port
-        self.pending_acks = {}  # Initialize here
-        key_path = Path('keys') / f'{user}.json'
+        self.relay_port = relay_port
+        self.udp_port = udp_port
+        self.discovery_port = discovery_port
+        self.peers = {}
+        self.selected_peer_hex = None
+        self.pending_deliveries = {}
+        self.relay_reader = None
+        self.relay_writer = None
+        self.relay_peer_pk = None
+        key_path = Path("keys") / f"{user}.json"
         self.identity = Identity.load(str(key_path))
-        log_path = Path('logs') / f'{user}.log'
+        log_path = Path("logs") / f"{user}.log"
         self.logger = SecureLogger(self.identity, str(log_path))
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield RichLog(id='chatlog', highlight=True, markup=True)
-        yield Input(placeholder="Type message...", id='input')
-        yield Button("Send", id='send')
-        yield StatusBar("Disconnected", id='status')
+        with Horizontal(id="main"):
+            yield Static("Peers:\n  (discovering...)", id="peers")
+            yield RichLog(id="chatlog", highlight=True, markup=True)
+        with Horizontal(id="composer"):
+            yield Input(placeholder="Type message or /to <peer8> ...", id="input")
+            yield Button("Send", id="send")
+        yield StatusBar("Disconnected", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.write_log("Connecting...")
+        self.write_log(f"Starting in [bold]{self.mode.upper()}[/] mode...")
         asyncio.create_task(self.connect())
 
-    async def connect(self):
+    async def connect(self) -> None:
+        if self.mode == "udp":
+            await self._connect_udp()
+        else:
+            await self._connect_relay()
+
+    async def _connect_udp(self) -> None:
+        self.udp_transport = UdpTransport("0.0.0.0", self.udp_port)
+        await self.udp_transport.start()
+        self.discovery = LanDiscovery(
+            username=self.user,
+            public_key=self.identity.pk.encode(),
+            listen_port=self.udp_port,
+            discovery_port=self.discovery_port,
+        )
+        await self.discovery.start(self._handle_presence)
+        self.connected = True
+        self.query_one("#status", StatusBar).update(
+            f"UDP connected on :{self.udp_port}, discovery :{self.discovery_port}"
+        )
+        asyncio.create_task(self.receive_loop())
+
+    async def _connect_relay(self) -> None:
         try:
-            # Create SSL context
             ssl_ctx = ssl.create_default_context()
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
-            
-            self.reader, self.writer = await asyncio.open_connection(
-                self.host, self.port, ssl=ssl_ctx
+            self.relay_reader, self.relay_writer = await asyncio.open_connection(
+                self.host, self.relay_port, ssl=ssl_ctx
             )
-
-            # Handshake: Send PK
-            self.writer.write(pack_connect(self.identity.pk.encode()))
-            await self.writer.drain()
-
-            # Recv connect ack
-            ack_data = await self.reader.read(1024)
-            if not ack_data:
-                raise Exception("No ACK received from server")
-            unpack_ack(ack_data)
-
-            # Load peer identity
-            peer_key_path = Path('keys') / ('bob.json' if self.user == 'alice' else 'alice.json')
-            peer_id = Identity.load(str(peer_key_path))
-            self.peer_pk = peer_id.pk.encode()
-            
-            # Derive session keys
-            # For key exchange to work, both parties must agree on roles:
-            # - The party with the lexicographically smaller public key is "client"
-            # - The party with the larger public key is "server"
-            my_pk = self.identity.pk.encode()
-            
-            # Determine roles based on public key comparison
-            i_am_client = my_pk < self.peer_pk
-            
-            if i_am_client:
-                # I'm client, peer is server
-                self.tx_key, self.rx_key = key_exchange(
-                    self.identity.sk, 
-                    self.identity.pk, 
-                    PublicKey(self.peer_pk)
-                )
-                self.write_log(f"[dim]Role: CLIENT | TX={self.tx_key.hex()[:16]}... RX={self.rx_key.hex()[:16]}...[/]")
-            else:
-                # I'm server, peer is client
-                self.tx_key, self.rx_key = key_exchange_server(
-                    self.identity.sk,
-                    self.identity.pk,
-                    PublicKey(self.peer_pk)
-                )
-                self.write_log(f"[dim]Role: SERVER | TX={self.tx_key.hex()[:16]}... RX={self.rx_key.hex()[:16]}...[/]")
-
+            self.relay_writer.write(pack_connect(self.identity.pk.encode()))
+            await self.relay_writer.drain()
+            ack_data = await self.relay_reader.read(1024)
+            if not ack_data or unpack_ack(ack_data) is None:
+                raise ConnectionError("No relay ACK")
             self.connected = True
-            self.query_one('#status', StatusBar).update("Connected")
-            self.write_log(f"Secure session with {self.peer_pk.hex()[:8]}...")
-
-            # Start receive loop
+            self.query_one("#status", StatusBar).update("Relay connected")
+            self.write_log("[yellow]Relay fallback mode active (single target with /to <peer8>).[/]")
             asyncio.create_task(self.receive_loop())
-            
-        except FileNotFoundError as e:
-            self.write_log(f"[red]Error: Peer key file not found - {e}[/]")
-            self.query_one('#status', StatusBar).update("Key Error")
-        except (ConnectionError, OSError, ssl.SSLError, ValueError) as e:
-            self.write_log(f"[red]Connection failed: {e}[/]")
-            self.query_one('#status', StatusBar).update("Connection Failed")
-        except Exception as e:
-            # Catch-all for unexpected errors
-            self.write_log(f"[red]Unexpected error: {e}[/]")
-            self.query_one('#status', StatusBar).update("Error")
+        except Exception as exc:
+            self.write_log(f"[red]Relay connection failed: {exc}[/]")
+            self.query_one("#status", StatusBar).update("Connection Failed")
 
-    async def receive_loop(self):
-        if not self.reader:
+    def _derive_session(self, peer_pk: bytes) -> tuple[bytes, bytes]:
+        my_pk = self.identity.pk.encode()
+        if my_pk < peer_pk:
+            return key_exchange(self.identity.sk, self.identity.pk, PublicKey(peer_pk))
+        return key_exchange_server(self.identity.sk, self.identity.pk, PublicKey(peer_pk))
+
+    def _handle_presence(self, presence: dict, addr: tuple[str, int]) -> None:
+        peer_pk = bytes(presence["pk"])
+        if peer_pk == self.identity.pk.encode():
             return
-            
+        username = str(presence["u"])
+        peer_addr = (addr[0], int(presence["p"]))
+        if peer_pk not in self.peers:
+            tx_key, rx_key = self._derive_session(peer_pk)
+            self.peers[peer_pk] = PeerSession(
+                username=username, pk=peer_pk, addr=peer_addr, tx_key=tx_key, rx_key=rx_key
+            )
+            self.write_log(f"[green]Discovered peer[/] {username} ({peer_pk.hex()[:8]}) @ {peer_addr}")
+            if self.selected_peer_hex is None:
+                self.selected_peer_hex = peer_pk.hex()[:8]
+        peer = self.peers[peer_pk]
+        peer.addr = peer_addr
+        peer.last_seen = time.time()
+        self._refresh_peers_panel()
+
+    def _refresh_peers_panel(self) -> None:
+        panel = self.query_one("#peers", Static)
+        now = time.time()
+        if not self.peers:
+            panel.update("Peers:\n  (discovering...)")
+            return
+        lines = ["Peers:"]
+        for peer in sorted(self.peers.values(), key=lambda p: p.username):
+            age = int(now - peer.last_seen)
+            marker = "*" if peer.pk.hex()[:8] == self.selected_peer_hex else " "
+            lines.append(f"{marker} {peer.username:<10} {peer.pk.hex()[:8]}  {age:>3}s")
+        panel.update("\n".join(lines))
+
+    async def receive_loop(self) -> None:
         while self.connected:
             try:
-                data = await self.reader.read(4096)
-                if not data:
-                    break
-                
-                # First try to unpack and check type
-                try:
-                    raw_msg = msgpack.unpackb(data, raw=False)
-                    msg_type = raw_msg.get('type')
-                    
-                    # Route based on message type
-                    if msg_type == MSG_TYPES['msg']:
-                        msg = unpack_message(data)
-                        if msg:
-                            await self.handle_message(msg)
-                    elif msg_type == MSG_TYPES['ack']:
-                        ack_hash = unpack_ack(data)
-                        if ack_hash:
-                            await self.handle_ack(ack_hash)
-                    else:
-                        self.write_log(f"[yellow]Unknown message type: {msg_type}[/]")
-                        
-                except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError, TypeError) as e:
-                    self.write_log(f"[yellow]Failed to parse message: {e}[/]")
-                    continue
-
-            except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
-                self.write_log(f"[red]Recv error: {e}[/]")
-                break
+                if self.mode == "udp":
+                    if not self.udp_transport:
+                        break
+                    data, addr = await self.udp_transport.recv()
+                    await self._handle_udp_packet(data, addr)
+                else:
+                    if not self.relay_reader:
+                        break
+                    data = await self.relay_reader.read(4096)
+                    if not data:
+                        break
+                    await self._handle_relay_packet(data)
             except asyncio.CancelledError:
-                # Task was cancelled
                 break
-
+            except Exception as exc:
+                self.write_log(f"[red]Receive loop error: {exc}[/]")
         self.connected = False
-        # Clean up pending ACKs on disconnect
-        for future in self.pending_acks.values():
-            if not future.done():
-                future.cancel()
-        self.pending_acks.clear()
-        
-        # Close writer if still open
-        if self.writer:
-            try:
-                self.writer.close()
-                await self.writer.wait_closed()
-            except (OSError, asyncio.CancelledError):
-                pass
-            finally:
-                self.writer = None
-                self.reader = None
-        
-        self.query_one('#status', StatusBar).update("Disconnected")
+        self.query_one("#status", StatusBar).update("Disconnected")
 
-    async def handle_message(self, msg: dict) -> None:
-        """Handle incoming encrypted message."""
-        ct = bytes(msg['c'])
-        
-        # Type guard for rx_key
-        if not self.rx_key:
-            self.write_log("[red]Error: No receive key available[/]")
+    async def _handle_udp_packet(self, data: bytes, addr: tuple[str, int]) -> None:
+        msg = unpack_udp_message(data)
+        if msg:
+            await self._handle_udp_message(msg, addr)
             return
-        
-        try:
-            plain = decrypt(self.rx_key, ct)
-        except Exception as e:
-            self.write_log(f"[red]Decryption error: {e}[/]")
-            self.post_message(LeakAlert())
+        ack = unpack_udp_ack(data)
+        if ack:
+            await self._handle_udp_ack(ack)
+
+    async def _handle_udp_message(self, msg: dict, addr: tuple[str, int]) -> None:
+        if not self.udp_transport:
             return
-        
+        msg_id = bytes(msg["id"])
+        if self.udp_transport.is_duplicate(msg_id):
+            return
+        self.udp_transport.mark_seen(msg_id)
+
+        sender_pk = bytes(msg["from"])
+        peer = self.peers.get(sender_pk)
+        if peer is None:
+            tx_key, rx_key = self._derive_session(sender_pk)
+            peer = PeerSession(
+                username=sender_pk.hex()[:8], pk=sender_pk, addr=addr, tx_key=tx_key, rx_key=rx_key
+            )
+            self.peers[sender_pk] = peer
+        peer.addr = addr
+        peer.last_seen = time.time()
+        self._refresh_peers_panel()
+
+        plain = decrypt(peer.rx_key, bytes(msg["c"]))
         if plain is None:
             self.post_message(LeakAlert())
-            self.write_log("[red]DECRYPT FAILED: Potential leak/tamper![/]")
-            self.write_log(f"[dim]Debug: Ciphertext length: {len(ct)}, RX key length: {len(self.rx_key) if self.rx_key else 0}[/]")
-            self.write_log("[yellow]Tip: Run 'python debug_keys.py' to verify key exchange[/]")
+            self.write_log("[red]DECRYPT FAILED: Potential tamper detected[/]")
             return
-
-        computed_hash = hash_message(plain)
-        if computed_hash != bytes(msg['h']):
+        received_hash = bytes(msg["h"])
+        if hash_message(plain) != received_hash:
             self.post_message(LeakAlert())
-            self.write_log("[red]HASH MISMATCH: Message altered in transit![/]")
+            self.write_log("[red]HASH MISMATCH: Message altered in transit[/]")
             return
 
-        # Type guard for peer_pk
-        if not self.peer_pk:
-            self.write_log("[red]Error: No peer public key[/]")
+        ack = pack_udp_ack(msg_id, received_hash, self.identity.pk.encode())
+        self.udp_transport.send(ack, peer.addr)
+        text = plain.decode("utf-8", errors="replace")
+        self.write_log(f"[blue]{peer.username}[/]: {text}")
+        self.logger.log_entry("<<", sender_pk, plain, received_hash)
+
+    async def _handle_udp_ack(self, ack: dict) -> None:
+        msg_id = bytes(ack["id"])
+        pending = self.pending_deliveries.get(msg_id)
+        if not pending:
             return
+        if bytes(ack["h"]) != pending.msg_hash:
+            self.post_message(LeakAlert())
+            self.write_log("[red]ACK HASH MISMATCH: Potential tamper[/]")
+            return
+        pending.acked = True
+        self.write_log(f"[green]ACK[/] {pending.peer_name}: {pending.message_text}")
+        del self.pending_deliveries[msg_id]
 
-        self.write_log(f"[blue]{self.peer_pk.hex()[:8]}[/]: {plain.decode()}")
-        self.logger.log_entry('<<', self.peer_pk, plain, bytes(msg['h']))
+    async def _handle_relay_packet(self, data: bytes) -> None:
+        message = unpack_message(data)
+        if message and message.get("type") == MSG_TYPES["msg"]:
+            await self._handle_relay_message(message)
+            return
+        ack_hash = unpack_ack(data)
+        if ack_hash:
+            for msg_id, pending in list(self.pending_deliveries.items()):
+                if pending.msg_hash == ack_hash:
+                    pending.acked = True
+                    self.write_log(f"[green]ACK[/] relay {pending.peer_name}: {pending.message_text}")
+                    del self.pending_deliveries[msg_id]
+                    break
 
-    async def handle_ack(self, ack_hash: bytes) -> None:
-        """Handle ACK response."""
-        if ack_hash in self.pending_acks:
-            future = self.pending_acks.pop(ack_hash)
-            if not future.done():
-                try:
-                    future.set_result(ack_hash)
-                except asyncio.InvalidStateError:
-                    # Future already completed/cancelled
-                    pass
+    async def _handle_relay_message(self, msg: dict) -> None:
+        if self.relay_peer_pk is None:
+            sender = bytes(msg["to"]) if isinstance(msg.get("to"), (bytes, bytearray)) else b"relay"
+            self.relay_peer_pk = sender
+        peer_pk = self.relay_peer_pk
+        tx_key, rx_key = self._derive_session(peer_pk)
+        plain = decrypt(rx_key, bytes(msg["c"]))
+        if plain is None:
+            self.post_message(LeakAlert())
+            return
+        if hash_message(plain) != bytes(msg["h"]):
+            self.post_message(LeakAlert())
+            return
+        self.write_log(f"[blue]{peer_pk.hex()[:8]}[/]: {plain.decode('utf-8', errors='replace')}")
+        self.logger.log_entry("<<", peer_pk, plain, bytes(msg["h"]))
+
+    async def _send_udp_with_retry(self, pending: PendingDelivery) -> None:
+        if not self.udp_transport:
+            return
+        while pending.attempts_left > 0 and not pending.acked:
+            self.udp_transport.send(pending.packet, pending.addr)
+            pending.attempts_left -= 1
+            self.write_log(
+                f"[dim]sent -> {pending.peer_name} ({3 - pending.attempts_left}/3): {pending.message_text}[/]"
+            )
+            await asyncio.sleep(1.5)
+        if not pending.acked and pending.msg_id in self.pending_deliveries:
+            self.write_log(f"[yellow]Delivery failed[/] {pending.peer_name}: {pending.message_text}")
+            del self.pending_deliveries[pending.msg_id]
+
+    async def _send_relay(self, peer_pk: bytes, text: str) -> None:
+        if not self.relay_writer:
+            self.write_log("[red]Relay writer unavailable[/]")
+            return
+        tx_key, _ = self._derive_session(peer_pk)
+        msg_bytes = text.encode()
+        msg_hash = hash_message(msg_bytes)
+        ct = encrypt(tx_key, msg_bytes)
+        self.relay_writer.write(pack_message(peer_pk, msg_hash, ct, time.time()))
+        await self.relay_writer.drain()
+        self.write_log(f"[green]>>[/] {text}")
+        self.logger.log_entry(">>", peer_pk, msg_bytes, msg_hash)
 
     @on(Button.Pressed, "#send")
     @on(Input.Submitted, "#input")
     async def send_message(self, event: Button.Pressed | Input.Submitted) -> None:
-        input_widget = self.query_one('#input', Input)
+        input_widget = self.query_one("#input", Input)
         msg = input_widget.value.strip()
-        
         if not msg or not self.connected:
             return
+        input_widget.value = ""
 
-        # Type guards
-        if not self.tx_key or not self.peer_pk or not self.writer:
-            self.write_log("[red]Error: Connection not properly established[/]")
+        if msg.startswith("/to "):
+            parts = msg.split(maxsplit=2)
+            if len(parts) < 3:
+                self.write_log("[yellow]Usage: /to <peer8> <message>[/]")
+                return
+            self.selected_peer_hex = parts[1].strip()
+            self._refresh_peers_panel()
+            msg = parts[2].strip()
+            if not msg:
+                return
+
+        if self.mode == "udp":
+            await self._send_udp(msg)
+        else:
+            await self._send_relay_message(msg)
+
+    async def _send_udp(self, text: str) -> None:
+        if not self.peers:
+            self.write_log("[yellow]No peers discovered yet[/]")
             return
-
-        input_widget.value = ''
-        msg_bytes = msg.encode()
-
-        try:
-            # Hash before encrypt
+        targets = [p for p in self.peers.values() if p.pk.hex().startswith(self.selected_peer_hex or "")]
+        if not targets:
+            targets = list(self.peers.values())
+        msg_bytes = text.encode()
+        for peer in targets:
             msg_hash = hash_message(msg_bytes)
+            ct = encrypt(peer.tx_key, msg_bytes)
+            msg_id = nacl_random(16)
+            packet = pack_udp_message(
+                msg_id=msg_id,
+                seq=peer.next_seq,
+                sender_pk=self.identity.pk.encode(),
+                to_pk=peer.pk,
+                msg_hash=msg_hash,
+                ciphertext=ct,
+                ts=time.time(),
+            )
+            peer.next_seq += 1
+            self.logger.log_entry(">>", peer.pk, msg_bytes, msg_hash)
+            pending = PendingDelivery(
+                msg_id=msg_id,
+                msg_hash=msg_hash,
+                packet=packet,
+                addr=peer.addr,
+                peer_name=peer.username,
+                message_text=text,
+            )
+            self.pending_deliveries[msg_id] = pending
+            asyncio.create_task(self._send_udp_with_retry(pending))
 
-            # Encrypt using tx_key
-            ct = encrypt(self.tx_key, msg_bytes)
+    async def _send_relay_message(self, text: str) -> None:
+        peer = self._pick_relay_peer()
+        if not peer:
+            self.write_log("[yellow]No peer key found for relay mode. Use /to <peer8> ...[/]")
+            return
+        await self._send_relay(peer, text)
 
-            # Create future for ACK
-            ack_future = asyncio.get_event_loop().create_future()
-            self.pending_acks[msg_hash] = ack_future
-
-            # Pack & send
-            self.writer.write(pack_message(self.peer_pk, msg_hash, ct, time.time()))
-            await self.writer.drain()
-
-            self.write_log(f"[green]>>[/] {msg}")
-            self.logger.log_entry('>>', self.peer_pk, msg_bytes, msg_hash)
-
-            # Wait for ack with timeout
-            try:
-                received_hash = await asyncio.wait_for(ack_future, timeout=5.0)
-                
-                if received_hash != msg_hash:
-                    self.post_message(LeakAlert())
-                    self.write_log("[red]ACK HASH MISMATCH: Server tamper detected![/]")
-            except asyncio.TimeoutError:
-                self.write_log("[yellow]Warning: ACK timeout[/]")
-                if msg_hash in self.pending_acks:
-                    del self.pending_acks[msg_hash]
-                
-        except (ConnectionError, OSError, ValueError) as e:
-            self.write_log(f"[red]Send error: {e}[/]")
-            if msg_hash in self.pending_acks:
-                del self.pending_acks[msg_hash]
+    def _pick_relay_peer(self) -> Optional[bytes]:
+        key_dir = Path("keys")
+        if not key_dir.exists():
+            return None
+        target_prefix = self.selected_peer_hex or ""
+        for file in key_dir.glob("*.json"):
+            if file.stem == self.user:
+                continue
+            identity = Identity.load(str(file))
+            pk = identity.pk.encode()
+            if pk.hex().startswith(target_prefix):
+                return pk
+        return None
 
     async def on_leak_alert(self, message: LeakAlert) -> None:
         self.bell()
-        self.query_one('#status', StatusBar).update("[red]LEAK DETECTED![/]")
+        self.query_one("#status", StatusBar).update("[red]LEAK DETECTED![/]")
 
     def action_verify_log(self) -> None:
         """Verify log chain integrity."""
@@ -330,21 +481,23 @@ class ChatApp(App):
 
     def write_log(self, text: str) -> None:
         """Write to chat log (renamed to avoid conflict with Textual's log)."""
-        chat_log = self.query_one('#chatlog', RichLog)
+        chat_log = self.query_one("#chatlog", RichLog)
         chat_log.write(text)
 
 
-def main():
+def main() -> None:
     """Entry point for client."""
     if len(sys.argv) < 2:
-        print("Usage: python -m src.encrypt.client <username>")
-        print("Example: python -m src.encrypt.client alice")
+        print("Usage: python -m src.encrypt.client <username> [udp|relay] [udp_port]")
+        print("Example: python -m src.encrypt.client alice udp 9001")
         sys.exit(1)
-        
+
     user = sys.argv[1]
-    app = ChatApp(user)
+    mode = sys.argv[2] if len(sys.argv) > 2 else "udp"
+    udp_port = int(sys.argv[3]) if len(sys.argv) > 3 else 9000
+    app = ChatApp(user=user, mode=mode, udp_port=udp_port)
     app.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

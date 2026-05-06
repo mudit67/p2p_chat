@@ -1,23 +1,17 @@
 #!/bin/bash
-# Cleanup script - Stop all E2EE chat servers
+# Cleanup script - Stop LAN chat clients / old relay server
 
-echo "=== E2EE Chat Cleanup ==="
+echo "=== E2EE LAN Chat Cleanup ==="
 echo ""
 
-# Find and kill processes on port 8888
-PIDS=$(lsof -ti:8888 2>/dev/null || true)
+for PORT in 8888 9001 9002 9003 9999; do
+    PIDS=$(lsof -ti:$PORT 2>/dev/null || true)
+    if [ ! -z "$PIDS" ]; then
+        echo "Port $PORT -> stopping: $PIDS"
+        for PID in $PIDS; do
+            kill -9 $PID 2>/dev/null || true
+        done
+    fi
+done
 
-if [ -z "$PIDS" ]; then
-    echo "✓ No servers running on port 8888"
-else
-    echo "Found server processes: $PIDS"
-    for PID in $PIDS; do
-        echo "Killing process $PID..."
-        kill -9 $PID 2>/dev/null || true
-    done
-    sleep 1
-    echo "✓ All servers stopped"
-fi
-
-echo ""
-echo "Port 8888 is now free"
+echo "✓ Cleanup complete"
