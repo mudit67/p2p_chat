@@ -69,8 +69,9 @@ When you send a message:
 
 ### Basic Commands
 
-- **Send to all peers**: Type message and press Enter
+- **Broadcast to all peers**: Type message and press Enter (sends to all discovered peers)
 - **Send to specific peer**: `/to <peer8> <message>` where `peer8` is first 8 hex chars of peer's public key
+- **Explicit broadcast**: `/broadcast <message>` to explicitly broadcast to all peers
 - **Verify audit log**: Press `L` to verify encrypted message history
 
 ### UI Layout

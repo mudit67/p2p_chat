@@ -240,8 +240,6 @@ class ChatApp(App):
                 username=username, pk=peer_pk, addr=peer_addr, tx_key=tx_key, rx_key=rx_key
             )
             self.write_log(f"[green]Discovered peer[/] {username} ({peer_pk.hex()[:8]}) @ {peer_addr}")
-            if self.selected_peer_hex is None:
-                self.selected_peer_hex = peer_pk.hex()[:8]
         else:
             # Peer reconnected or updated
             peer = self.peers[peer_pk]
@@ -470,29 +468,63 @@ class ChatApp(App):
             return
         input_widget.value = ""
 
-        if msg.startswith("/to "):
+        target_peer_hex = None
+        if msg.startswith("/broadcast "):
+            parts = msg.split(maxsplit=1)
+            msg = parts[1] if len(parts) > 1 else ""
+            if not msg:
+                self.write_log("[yellow]Usage: /broadcast <message>[/]")
+                return
+            # Send to all peers
+            if self.mode == "udp":
+                await self._send_udp(msg, broadcast=True)
+            else:
+                await self._send_relay_message(msg)
+            return
+        elif msg.startswith("/to "):
             parts = msg.split(maxsplit=2)
             if len(parts) < 3:
                 self.write_log("[yellow]Usage: /to <peer8> <message>[/]")
                 return
-            self.selected_peer_hex = parts[1].strip()
-            self._refresh_peers_panel()
+            target_peer_hex = parts[1].strip()
             msg = parts[2].strip()
             if not msg:
                 return
 
         if self.mode == "udp":
-            await self._send_udp(msg)
+            await self._send_udp(msg, target_peer_hex=target_peer_hex)
         else:
             await self._send_relay_message(msg)
 
-    async def _send_udp(self, text: str) -> None:
+    async def _send_udp(self, text: str, target_peer_hex: Optional[str] = None, broadcast: bool = False) -> None:
+        """Send UDP message to peers.
+        
+        Args:
+            text: Message text
+            target_peer_hex: Send only to peer with this hex prefix (unicast)
+            broadcast: If True, send to all peers
+        """
         if not self.peers:
             self.write_log("[yellow]No peers discovered yet[/]")
             return
-        targets = [p for p in self.peers.values() if p.pk.hex().startswith(self.selected_peer_hex or "")]
-        if not targets:
+        
+        # Determine target peers
+        if broadcast:
+            # Broadcast to all peers
             targets = list(self.peers.values())
+            if targets:
+                self.write_log(f"[cyan]Broadcasting to {len(targets)} peer(s)[/]")
+        elif target_peer_hex:
+            # Send to specific peer by hex prefix
+            targets = [p for p in self.peers.values() if p.pk.hex()[:8].startswith(target_peer_hex)]
+            if not targets:
+                self.write_log(f"[yellow]Peer {target_peer_hex} not found[/]")
+                return
+        else:
+            # Default: broadcast to all peers (no auto-selection)
+            targets = list(self.peers.values())
+            if len(targets) > 1:
+                self.write_log(f"[cyan]Broadcasting to {len(targets)} peer(s)[/]")
         msg_bytes = text.encode()
         for peer in targets:
             msg_hash = hash_message(msg_bytes)
