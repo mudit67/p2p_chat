@@ -13,7 +13,7 @@ from typing import Optional
 from nacl.utils import random as nacl_random
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
@@ -42,6 +42,7 @@ from .protocol import (
     unpack_udp_message,
 )
 from .udp_transport import UdpTransport
+from .file_transfer import FileTransfer
 
 
 class LeakAlert(Message):
@@ -81,10 +82,20 @@ class ChatApp(App):
     #main {
         height: 1fr;
     }
-    #peers {
+    #sidebar {
         width: 32;
+        height: 100%;
+    }
+    #peers {
+        height: 1fr;
         border: round $accent;
         padding: 0 1;
+    }
+    #help {
+        height: auto;
+        border: round $warning;
+        padding: 0 1;
+        color: $text-muted;
     }
     RichLog {
         height: 1fr;
@@ -102,6 +113,11 @@ class ChatApp(App):
         margin-left: 1;
         width: auto;
     }
+    #btn-file {
+        background: $warning;
+        color: $text;
+        margin-left: 1;
+    }
     StatusBar {
         dock: bottom;
         height: 1;
@@ -113,6 +129,7 @@ class ChatApp(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("l", "verify_log", "Verify Log"),
+        ("h", "toggle_help", "Help"),
     ]
 
     # Peer discovery timeout (remove peers not seen for 10 seconds)
@@ -155,24 +172,44 @@ class ChatApp(App):
         self.relay_writer = None
         self.relay_peer_pk = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._file_transfer: Optional[FileTransfer] = None
         key_path = Path("keys") / f"{user}.json"
         self.identity = Identity.load(str(key_path))
         log_path = Path("logs") / f"{user}.log"
         self.logger = SecureLogger(self.identity, str(log_path))
 
+    HELP_TEXT = (
+        "[bold yellow]Commands[/]\n"
+        " [cyan]<message>[/]        send to selected peer\n"
+        " [cyan]/to <id> <msg>[/]   target peer by id\n"
+        " [cyan]/send <path>[/]     send file to peer\n"
+        " [cyan]/ping[/]            measure latency\n"
+        "\n[bold yellow]Keys[/]\n"
+        " [cyan]l[/]  verify log chain\n"
+        " [cyan]h[/]  toggle this panel\n"
+        " [cyan]^c[/] quit\n"
+        "\n[bold yellow]Peer Status[/]\n"
+        " [green]✓[/] active  [yellow]◐[/] idle  [red]✗[/] lost\n"
+        " [cyan]*[/] = selected peer"
+    )
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main"):
-            yield Static("Peers:\n  (discovering...)", id="peers")
+            with Vertical(id="sidebar"):
+                yield Static("Peers:\n  (discovering...)", id="peers")
+                yield Static(self.HELP_TEXT, id="help")
             yield RichLog(id="chatlog", highlight=True, markup=True)
         with Horizontal(id="composer"):
-            yield Input(placeholder="Type message or /to <peer8> ...", id="input")
+            yield Input(placeholder="msg  /to <id> <msg>  /send <path>  /ping", id="input")
             yield Button("Send", id="send")
+            yield Button("📎 File", id="btn-file")
         yield StatusBar("Disconnected", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.write_log(f"Starting in [bold]{self.mode.upper()}[/] mode...")
+        self.write_log(f"[bold green]Welcome, {self.user}![/] Starting in [bold]{self.mode.upper()}[/] mode...")
+        self.write_log("[dim]Press [cyan]h[/] to toggle help  •  [cyan]l[/] to verify log  •  [cyan]^c[/] to quit[/]")
         asyncio.create_task(self.connect())
         self._cleanup_task = asyncio.create_task(self._peer_cleanup_loop())
 
@@ -185,6 +222,8 @@ class ChatApp(App):
     async def _connect_udp(self) -> None:
         self.udp_transport = UdpTransport("0.0.0.0", self.udp_port)
         await self.udp_transport.start()
+        self._file_transfer = FileTransfer(self.udp_transport, self.identity.pk.encode())
+        self._file_transfer.set_on_complete(self._on_file_received)
         self.discovery = LanDiscovery(
             username=self.user,
             public_key=self.identity.pk.encode(),
@@ -346,6 +385,8 @@ class ChatApp(App):
         self.exit()
 
     async def _handle_udp_packet(self, data: bytes, addr: tuple[str, int]) -> None:
+        if self._file_transfer and self._file_transfer.handle_packet(data):
+            return
         msg = unpack_udp_message(data)
         if msg:
             await self._handle_udp_message(msg, addr)
@@ -461,6 +502,12 @@ class ChatApp(App):
         self.write_log(f"[green]>>[/] {text}")
         self.logger.log_entry(">>", peer_pk, msg_bytes, msg_hash)
 
+    @on(Button.Pressed, "#btn-file")
+    async def prompt_file_send(self, event: Button.Pressed) -> None:
+        input_widget = self.query_one("#input", Input)
+        input_widget.value = "/send "
+        input_widget.focus()
+
     @on(Button.Pressed, "#send")
     @on(Input.Submitted, "#input")
     async def send_message(self, event: Button.Pressed | Input.Submitted) -> None:
@@ -480,6 +527,14 @@ class ChatApp(App):
             msg = parts[2].strip()
             if not msg:
                 return
+
+        if msg.startswith("/send "):
+            await self._handle_send_file_command(msg[6:].strip())
+            return
+
+        if msg == "/ping":
+            self._handle_ping_command()
+            return
 
         if self.mode == "udp":
             await self._send_udp(msg)
@@ -544,6 +599,45 @@ class ChatApp(App):
     async def on_leak_alert(self, message: LeakAlert) -> None:
         self.bell()
         self.query_one("#status", StatusBar).update("[red]LEAK DETECTED![/]")
+
+    async def _handle_send_file_command(self, filepath: str) -> None:
+        if not filepath:
+            self.write_log("[yellow]Usage: /send <filepath>[/]")
+            return
+        if not self._file_transfer:
+            self.write_log("[red]File transfer only available in UDP mode[/]")
+            return
+        targets = [p for p in self.peers.values() if p.pk.hex().startswith(self.selected_peer_hex or "")]
+        if not targets:
+            targets = list(self.peers.values())
+        if not targets:
+            self.write_log("[yellow]No peers available to send file[/]")
+            return
+        for peer in targets:
+            try:
+                self.write_log(f"[dim]📎 Sending [cyan]{filepath}[/] → {peer.username}...[/]")
+                await self._file_transfer.send_file(filepath, peer.addr)
+                self.write_log(f"[green]✓ File sent:[/] {filepath} → {peer.username}")
+            except FileNotFoundError:
+                self.write_log(f"[red]File not found:[/] {filepath}")
+            except Exception as exc:
+                self.write_log(f"[red]File send error:[/] {exc}")
+
+    def _handle_ping_command(self) -> None:
+        self.write_log("[dim]Ping is available via StatsTracker — wire /ping in stats.py[/]")
+
+    def _on_file_received(self, filename: str, data: bytes, transfer_id_hex: str) -> None:
+        if not data:
+            self.write_log(f"[red]✗ File '{filename}' received but checksum failed — discarded[/]")
+            return
+        save_path = Path("downloads") / filename
+        save_path.parent.mkdir(exist_ok=True)
+        save_path.write_bytes(data)
+        self.write_log(f"[green]📎 File received:[/] [cyan]{filename}[/] ({len(data)} bytes) → downloads/{filename}")
+
+    def action_toggle_help(self) -> None:
+        help_panel = self.query_one("#help", Static)
+        help_panel.display = not help_panel.display
 
     def action_verify_log(self) -> None:
         """Verify log chain integrity."""

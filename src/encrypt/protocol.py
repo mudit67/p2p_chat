@@ -13,6 +13,10 @@ MSG_TYPES = {
     "ack": 3,       # Relay + UDP ack
     "presence": 4,  # UDP discovery/presence
     "udp_msg": 5,   # UDP encrypted direct message
+    "file_meta": 6, # File transfer metadata
+    "file_chunk": 7, # File transfer chunk
+    "stats_ping": 8, # Latency ping
+    "stats_pong": 9, # Latency pong
 }
 
 MAX_CLOCK_SKEW_SECONDS = 60.0
@@ -162,5 +166,80 @@ def unpack_udp_ack(data: bytes) -> Optional[Dict[str, Any]]:
     if not isinstance(msg.get("h"), (bytes, bytearray)):
         return None
     if not isinstance(msg.get("from"), (bytes, bytearray)):
+        return None
+    return msg
+
+
+# --- File Transfer ---
+
+def pack_file_meta(transfer_id: bytes, filename: str, total_size: int, total_chunks: int, checksum: str, sender_pk: bytes) -> bytes:
+    return msgpack.packb({
+        "type": MSG_TYPES["file_meta"],
+        "id": transfer_id,
+        "name": filename,
+        "size": total_size,
+        "chunks": total_chunks,
+        "sha256": checksum,
+        "from": sender_pk,
+        "t": time.time(),
+    })
+
+
+def unpack_file_meta(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["file_meta"]:
+        return None
+    return msg
+
+
+def pack_file_chunk(transfer_id: bytes, seq: int, data: bytes, sender_pk: bytes) -> bytes:
+    return msgpack.packb({
+        "type": MSG_TYPES["file_chunk"],
+        "id": transfer_id,
+        "seq": seq,
+        "data": data,
+        "from": sender_pk,
+        "t": time.time(),
+    })
+
+
+def unpack_file_chunk(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["file_chunk"]:
+        return None
+    return msg
+
+
+# --- Stats ---
+
+def pack_stats_ping(ping_id: bytes, sender_pk: bytes) -> bytes:
+    return msgpack.packb({
+        "type": MSG_TYPES["stats_ping"],
+        "id": ping_id,
+        "from": sender_pk,
+        "t": time.time(),
+    })
+
+
+def unpack_stats_ping(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["stats_ping"]:
+        return None
+    return msg
+
+
+def pack_stats_pong(ping_id: bytes, sender_pk: bytes, original_ts: float) -> bytes:
+    return msgpack.packb({
+        "type": MSG_TYPES["stats_pong"],
+        "id": ping_id,
+        "from": sender_pk,
+        "orig_t": original_ts,
+        "t": time.time(),
+    })
+
+
+def unpack_stats_pong(data: bytes) -> Optional[Dict[str, Any]]:
+    msg = _unpack_dict(data)
+    if not msg or msg.get("type") != MSG_TYPES["stats_pong"]:
         return None
     return msg
